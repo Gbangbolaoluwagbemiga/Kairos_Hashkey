@@ -1823,10 +1823,17 @@ async function handleGetPerpMarkets(symbol?: string): Promise<{ data: string; tx
 
 
 // Function to handle tokenomics analysis
-async function handleGetTokenomics(symbol: string): Promise<{ data: string; txHash?: string }> {
+async function handleGetTokenomics(
+    symbol: string,
+    receiptSink?: (agentId: string, txHash: string) => void
+): Promise<{ data: string; txHash?: string }> {
     console.log(`[Gemini] 📊 Analyzing tokenomics for ${symbol}...`);
 
-    const payP = withTimeoutOptional(createTokenomicsPayment(`tokenomics:${symbol}`), PAYMENT_CAPTURE_TIMEOUT_MS);
+    const payP = createTokenomicsPayment(`tokenomics:${symbol}`);
+    // Fire-and-forget payment: keep response fast, but publish receipt when ready.
+    void payP.then((h) => {
+        if (h) receiptSink?.("tokenomics", h);
+    }).catch(() => {});
     const analysis = await tokenomicsService.analyzeTokenomics(symbol);
 
     if (!analysis) {
@@ -1835,7 +1842,7 @@ async function handleGetTokenomics(symbol: string): Promise<{ data: string; txHa
 
     // Pay Tokenomics agent
     tokenomicsQueryCount++;
-    const txHash = await payP;
+    const txHash = await withTimeoutOptional(payP, PAYMENT_CAPTURE_TIMEOUT_MS);
 
     // Format response for Gemini
     const hasUnlocks = analysis.upcomingUnlocks.length > 0;
@@ -2176,7 +2183,7 @@ export async function generateResponse(
             if (call.name === "getTokenomics") {
                 agentsUsed.add("tokenomics");
                 const args = call.args as { symbol: string };
-                const r = await withTimeout(handleGetTokenomics(args.symbol), perCallTimeout);
+                const r = await withTimeout(handleGetTokenomics(args.symbol, receiptSink), perCallTimeout);
                 if (r.txHash) txHashes["tokenomics"] = r.txHash;
                 return { key: resultKey, name: call.name, raw: r.data };
             }

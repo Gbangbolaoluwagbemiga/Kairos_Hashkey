@@ -75,6 +75,37 @@ export function fourmemeProvider(cfg: FourmemeChainConfig): ethers.JsonRpcProvid
     return new ethers.JsonRpcProvider(cfg.rpcUrl, cfg.chainId);
 }
 
+/**
+ * Nonce management
+ *
+ * Why: waiting for 1 confirm to "serialize" txs makes receipts slow/missing and can stall UX
+ * when an RPC lags. Instead, we keep an in-process nextNonce counter seeded from `pending`
+ * and we always return the tx hash immediately after broadcasting.
+ *
+ * Safety: `runTreasurySerialized()` upstream ensures we never send concurrently.
+ */
+let treasuryNextNonce: number | null = null;
+let treasuryNonceRpcUrl: string | null = null;
+
+async function getAndBumpTreasuryNonce(wallet: ethers.Wallet, rpcUrl: string): Promise<number> {
+    if (!treasuryNonceRpcUrl || treasuryNonceRpcUrl !== rpcUrl) {
+        treasuryNonceRpcUrl = rpcUrl;
+        treasuryNextNonce = null;
+    }
+    if (treasuryNextNonce == null) {
+        // pending ensures we don’t collide with txs already in the mempool
+        treasuryNextNonce = await wallet.getNonce("pending");
+    }
+    const n = treasuryNextNonce;
+    treasuryNextNonce = n + 1;
+    return n;
+}
+
+function bumpGasPrice(gp: bigint, multNum = 12n, multDen = 10n): bigint {
+    // 1.2x by default
+    return (gp * multNum) / multDen;
+}
+
 async function withTimeout<T>(p: Promise<T>, timeoutMs: number, label: string): Promise<T> {
     let t: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, rej) => {
@@ -147,7 +178,7 @@ export async function sendTreasuryPayment(args: {
     label: string;
     spendingPolicy?: FourmemeSpendPolicyConfig;
 }): Promise<string> {
-    const { provider } = await getChainProvider(args.cfg);
+    const { rpcUrl, provider } = await getChainProvider(args.cfg);
     const wallet = new ethers.Wallet(args.cfg.treasuryPrivateKey, provider);
 
     /** When `1`, any canSpend revert or `false` blocks the payout. Default `0`: revert → pay anyway (demo / ABI mismatch). */
@@ -193,15 +224,44 @@ export async function sendTreasuryPayment(args: {
     const waitTimeoutMs = Math.max(5000, Number(process.env.KAIROS_TX_WAIT_TIMEOUT_MS ?? "180000") || 180000);
 
     // Put label into tx metadata only via logs off-chain; native transfers can't carry memo.
-    const tx = await wallet.sendTransaction({
-        to: args.to,
-        value: args.amountWei,
-    });
+    // Always broadcast quickly and return tx hash immediately (frontend will poll receipts).
+    const fee = await provider.getFeeData().catch(() => null);
+    let gasPrice = fee?.gasPrice ?? null;
 
-    // Wait until the payout is mined before releasing the treasury queue; otherwise the next
-    // payout can reuse a nonce that is still pending → "replacement fee too low" on some RPCs.
+    const attemptSend = async (bump: boolean) => {
+        if (gasPrice && bump) gasPrice = bumpGasPrice(gasPrice);
+        const nonce = await getAndBumpTreasuryNonce(wallet, rpcUrl);
+        return await wallet.sendTransaction({
+            to: args.to,
+            value: args.amountWei,
+            nonce,
+            // BNB testnet commonly prefers legacy gasPrice; EIP-1559 fields may be ignored.
+            gasPrice: gasPrice ?? undefined,
+        });
+    };
+
+    let tx: ethers.TransactionResponse;
+    try {
+        tx = await attemptSend(false);
+    } catch (e: any) {
+        const msg = String(e?.message || e || "");
+        // Reset nonce on common nonce/gas errors then retry once with bumped gas.
+        if (
+            msg.toLowerCase().includes("nonce") ||
+            msg.toLowerCase().includes("replacement") ||
+            msg.toLowerCase().includes("underpriced") ||
+            msg.toLowerCase().includes("already known")
+        ) {
+            treasuryNextNonce = null;
+            tx = await attemptSend(true);
+        } else {
+            throw e;
+        }
+    }
+
+    // Best-effort confirmation wait in the background (keeps nonce pipeline healthy on flaky RPCs).
     if (waitConfirms > 0) {
-        await tx.wait(waitConfirms, waitTimeoutMs);
+        void tx.wait(waitConfirms, waitTimeoutMs).catch(() => {});
     }
 
     // Record spend after the transfer is settled (best-effort; do not fail the payment if this fails)
@@ -210,11 +270,8 @@ export async function sendTreasuryPayment(args: {
             const policy = new ethers.Contract(args.spendingPolicy.spendingPolicyAddress, SPENDING_POLICY_ABI, wallet);
             const key = ethers.keccak256(ethers.toUtf8Bytes(args.agentKey));
             const rec = await policy.recordSpend(key, args.amountWei);
-            if (waitConfirms > 0) {
-                await rec.wait(waitConfirms, waitTimeoutMs);
-            } else {
-                void rec.wait().catch(() => {});
-            }
+            if (waitConfirms > 0) void rec.wait(waitConfirms, waitTimeoutMs).catch(() => {});
+            else void rec.wait().catch(() => {});
         } catch (e) {
             // non-fatal
             console.warn(`[Four.meme Sprint] recordSpend failed for ${args.agentKey} (${args.label}):`, (e as Error)?.message);
@@ -240,11 +297,16 @@ export async function sendAgentToAgentPayment(args: {
     const rpcUrl = urls[0] || "https://data-seed-prebsc-1-s1.binance.org:8545";
     const provider = new ethers.JsonRpcProvider(rpcUrl, args.chainId ?? 97);
     const wallet = new ethers.Wallet(args.fromPrivateKey, provider);
-    const tx = await wallet.sendTransaction({ to: args.to, value: args.amountWei });
+    const fee = await provider.getFeeData().catch(() => null);
+    const tx = await wallet.sendTransaction({
+        to: args.to,
+        value: args.amountWei,
+        gasPrice: fee?.gasPrice ?? undefined,
+    });
     const waitConfirms = Math.max(0, Math.min(12, Number(process.env.KAIROS_A2A_TX_WAIT_CONFIRMS ?? "1") || 0));
     const waitTimeoutMs = Math.max(5000, Number(process.env.KAIROS_TX_WAIT_TIMEOUT_MS ?? "180000") || 180000);
     if (waitConfirms > 0) {
-        await tx.wait(waitConfirms, waitTimeoutMs);
+        void tx.wait(waitConfirms, waitTimeoutMs).catch(() => {});
     }
     return tx.hash;
 }
