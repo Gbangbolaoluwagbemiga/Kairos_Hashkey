@@ -7,7 +7,12 @@ interface WalletContextType {
   isConnected: boolean;
   address: string | null;
   balance: string;
-  connect: () => void;
+  /** Connect (eth_requestAccounts). May not show a popup if the site is already authorized. */
+  connect: () => Promise<string | null>;
+  /** Force MetaMask to re-prompt account selection (wallet_requestPermissions). */
+  connectPrompt: () => Promise<string | null>;
+  /** Request a signature to prove wallet control (always triggers a popup). */
+  signIn: () => Promise<string | null>;
   disconnect: () => void;
   refreshBalance: () => void;
   chainOk: boolean;
@@ -61,7 +66,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       const eth = (window as any).ethereum;
       if (!eth) {
         toast.error('No EVM wallet detected. Please install MetaMask (or a compatible wallet).');
-        return;
+        return null;
       }
       providerRef.current = new ethers.BrowserProvider(eth);
 
@@ -92,11 +97,65 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       localStorage.setItem('kairos_address', userAddress);
       toast.success('Wallet connected!');
       refreshBalance();
+      return userAddress;
     } catch (error: any) {
       console.error('Connection failed:', error);
       toast.error('Failed to connect wallet');
+      return null;
     }
   }, [refreshBalance]);
+
+  const connectPrompt = useCallback(async () => {
+    const eth = (window as any).ethereum;
+    if (!eth) {
+      toast.error('No EVM wallet detected. Please install MetaMask (or a compatible wallet).');
+      return null;
+    }
+    try {
+      // This forces MetaMask to show the permissions/account selector UI again.
+      await eth.request({
+        method: 'wallet_requestPermissions',
+        params: [{ eth_accounts: {} }],
+      });
+    } catch {
+      // If user rejects, fall back to normal connect flow.
+    }
+    return await connect();
+  }, [connect]);
+
+  const signIn = useCallback(async () => {
+    try {
+      const eth = (window as any).ethereum;
+      if (!eth) {
+        toast.error('No EVM wallet detected. Please install MetaMask (or a compatible wallet).');
+        return null;
+      }
+
+      // Ensure we have an address (connect may be silent if already authorized).
+      const addr = address || (await connect());
+      if (!addr) return null;
+
+      // Ensure provider is initialized
+      providerRef.current = providerRef.current || new ethers.BrowserProvider(eth);
+      const signer = await providerRef.current.getSigner();
+
+      // This always triggers a wallet popup.
+      const issuedAt = new Date().toISOString();
+      const msg =
+        `Kairos Sign-In\n` +
+        `Address: ${addr}\n` +
+        `Issued At: ${issuedAt}\n` +
+        `Purpose: prove wallet control to enable agent actions`;
+      const sig = await signer.signMessage(msg);
+      toast.success('Signed in!');
+      return sig;
+    } catch (e: any) {
+      const msg = String(e?.message || e || '');
+      if (msg.toLowerCase().includes('user rejected')) toast.error('Signature rejected');
+      else toast.error('Sign-in failed');
+      return null;
+    }
+  }, [address, connect]);
 
   const disconnect = useCallback(() => {
     setAddress(null);
@@ -111,6 +170,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       address,
       balance,
       connect,
+      connectPrompt,
+      signIn,
       disconnect,
       refreshBalance,
       chainOk

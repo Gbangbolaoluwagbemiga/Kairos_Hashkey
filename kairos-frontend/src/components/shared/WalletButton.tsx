@@ -1,5 +1,5 @@
 import { useWallet } from '@/contexts/WalletContext';
-import { Wallet, LogOut, ExternalLink, ChevronDown } from 'lucide-react';
+import { LogOut, ExternalLink, RefreshCw, PenLine } from 'lucide-react';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -9,7 +9,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 
 export function WalletButton() {
-  const { isConnected, address, disconnect, connect } = useWallet();
+  const { isConnected, address, disconnect, signIn, connectPrompt } = useWallet();
 
   const truncatedAddress = address
     ? `${address.slice(0, 6)}...${address.slice(-4)}`
@@ -19,8 +19,7 @@ export function WalletButton() {
     return (
       <button
         onClick={() => {
-          console.log("Connect button clicked");
-          connect();
+          void signIn();
         }}
         className="flex items-center gap-2 px-5 py-2.5 liquid-glass-primary text-primary-foreground rounded-full text-sm font-medium"
       >
@@ -46,6 +45,20 @@ export function WalletButton() {
           <p className="text-xs text-muted-foreground">Connected</p>
         </div>
         <DropdownMenuSeparator />
+        <DropdownMenuItem
+          onClick={() => void signIn()}
+          className="rounded-xl cursor-pointer"
+        >
+          <PenLine className="w-4 h-4 mr-2" />
+          Sign again
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onClick={() => void connectPrompt()}
+          className="rounded-xl cursor-pointer"
+        >
+          <RefreshCw className="w-4 h-4 mr-2" />
+          Switch account
+        </DropdownMenuItem>
         <DropdownMenuItem
           onClick={() => window.open(`https://testnet.arcscan.app/address/${address}`, '_blank')}
           className="rounded-xl cursor-pointer"
